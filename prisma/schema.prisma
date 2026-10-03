@@ -1,0 +1,412 @@
+// Taka field-worker server — Neon Postgres via Prisma.
+// Runtime uses the pooled DATABASE_URL; migrations use DIRECT_URL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// The role an account is currently working in. A field-worker account may hold
+/// more than one and switch between them, mirroring the resident app's model.
+enum FieldRole {
+  COLLECTOR
+  DUKA_AGENT
+  RESPONDER
+}
+
+enum FieldUserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+enum CollectionStatus {
+  PENDING
+  COLLECTED
+  SKIPPED_NO_TRASH
+  DEFAULTED_UNPAID
+}
+
+enum MaterialCategory {
+  PET_PLASTIC
+  HDPE_RIGID
+  CORRUGATED_CARDBOARD
+  ALUMINUM
+}
+
+enum HubWeighInSyncStatus {
+  SYNCED
+  PENDING_HUB_QUEUE
+}
+
+enum BountyJobStatus {
+  AVAILABLE
+  CLAIMED
+  EN_ROUTE
+  PROOF_SUBMITTED
+  APPROVED
+}
+
+enum SyncModule {
+  ROUTE_UPDATE
+  HUB_WEIGH_IN
+  BOUNTY_CLEARANCE
+}
+
+/// Who a wallet belongs to. Residents and independent pickers are known to this
+/// server only through the synced ResidentDirectory; field workers are known
+/// directly.
+enum LedgerPartyType {
+  RESIDENT
+  COLLECTOR
+  INDEPENDENT_PICKER
+  FIELD_WORKER
+}
+
+enum LedgerEntryReason {
+  HUB_BUYBACK
+  BOUNTY_PAYOUT
+  ADJUSTMENT
+}
+
+model FieldWorkerUser {
+  id              String          @id @default(cuid())
+  phone           String          @unique
+  activeRole      FieldRole
+  status          FieldUserStatus @default(ACTIVE)
+  firstName       String?
+  lastName        String?
+  language        String?
+  themePreference String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  collector CollectorProfile?
+  duka      DukaAgentProfile?
+  responder ResponderProfile?
+
+  createdHubs   DukaHub[]     @relation("HubCreatedBy")
+  weighIns      HubWeighIn[]  @relation("WeighInAgent")
+  claimedJobs   BountyJob[]   @relation("BountyClaimedBy")
+  bountyClaims  BountyClaim[] @relation("BountyClaims")
+  updatedStops  RouteStop[]   @relation("StopUpdatedBy")
+  ledgerEntries LedgerEntry[] @relation("LedgerActor")
+}
+
+model CollectorProfile {
+  id        String          @id @default(cuid())
+  userId    String          @unique
+  user      FieldWorkerUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cboId     String
+  cbo       CboOrganization @relation(fields: [cboId], references: [id])
+  wardName  String
+  crewType  String          @default("PUSHCART")
+  createdAt DateTime        @default(now())
+
+  routes CollectorRoute[]
+}
+
+model ResponderProfile {
+  id            String          @id @default(cuid())
+  userId        String          @unique
+  user          FieldWorkerUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleType   String
+  vehiclePlate  String?
+  licenseNumber String?
+  createdAt     DateTime        @default(now())
+}
+
+model DukaAgentProfile {
+  id        String          @id @default(cuid())
+  userId    String          @unique
+  user      FieldWorkerUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hubId     String
+  hub       DukaHub         @relation(fields: [hubId], references: [id])
+  createdAt DateTime        @default(now())
+}
+
+model CboOrganization {
+  id           String   @id @default(cuid())
+  name         String
+  wardName     String
+  contactPhone String?
+  createdAt    DateTime @default(now())
+
+  collectors CollectorProfile[]
+  routes     CollectorRoute[]
+}
+
+model Ward {
+  id        String   @id @default(cuid())
+  name      String
+  region    String?
+  createdAt DateTime @default(now())
+
+  compounds Compound[]
+  routes    CollectorRoute[]
+
+  @@unique([name, region])
+}
+
+/// A collection point: one household or commercial plot on a ward route.
+model Compound {
+  id                 String   @id @default(cuid())
+  wardId             String
+  ward               Ward     @relation(fields: [wardId], references: [id])
+  lukuMeterNumber    String?  @unique
+  compoundUnitNumber String?
+  /// Hashed resident phone; the raw number never reaches this server.
+  residentPhoneHash  String
+  streetName         String
+  latitude           Float
+  longitude          Float
+  isPaidUp           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  stops RouteStop[]
+
+  @@index([wardId])
+  @@index([residentPhoneHash])
+}
+
+model CollectorRoute {
+  id              String           @id @default(cuid())
+  cboId           String
+  cbo             CboOrganization  @relation(fields: [cboId], references: [id])
+  collectorUserId String
+  collector       CollectorProfile @relation(fields: [collectorUserId], references: [id])
+  wardId          String
+  ward            Ward             @relation(fields: [wardId], references: [id])
+  wardName        String
+  serviceDate     DateTime         @db.Date
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  stops RouteStop[]
+
+  @@unique([collectorUserId, serviceDate])
+  @@index([collectorUserId, serviceDate])
+}
+
+model RouteStop {
+  id              String           @id @default(cuid())
+  routeId         String
+  route           CollectorRoute   @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  compoundId      String
+  compound        Compound         @relation(fields: [compoundId], references: [id])
+  status          CollectionStatus @default(PENDING)
+  /// Bound on the first collection: the device GPS pinned to this plot.
+  lockedLatitude  Float?
+  lockedLongitude Float?
+  lockedAt        DateTime?
+  notes           String?
+  updatedById     String?
+  updatedBy       FieldWorkerUser? @relation("StopUpdatedBy", fields: [updatedById], references: [id])
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@unique([routeId, compoundId])
+  @@index([status])
+}
+
+model DukaHub {
+  id          String           @id @default(cuid())
+  hubCode     String           @unique
+  name        String
+  wardName    String
+  latitude    Float
+  longitude   Float
+  createdById String?
+  createdBy   FieldWorkerUser? @relation("HubCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  agents   DukaAgentProfile[]
+  weighIns HubWeighIn[]
+
+  @@index([wardName])
+}
+
+/// Live buyback price for one material. New rows are appended as the market
+/// moves; the latest `effectiveAt` at or before "now" wins.
+model MaterialRate {
+  id           String           @id @default(cuid())
+  category     MaterialCategory
+  ratePerKgTzs Int
+  effectiveAt  DateTime         @default(now())
+  createdAt    DateTime         @default(now())
+
+  @@unique([category, effectiveAt])
+  @@index([category, effectiveAt])
+}
+
+/// One weigh-in at a hub. `sessionId` and `idempotencyKey` both originate on the
+/// device so a retried sync cannot create a second payout.
+model HubWeighIn {
+  id                String                    @id @default(cuid())
+  sessionId         String                    @unique
+  hubId             String
+  hub               DukaHub                   @relation(fields: [hubId], references: [id])
+  agentUserId       String
+  agent             FieldWorkerUser           @relation("WeighInAgent", fields: [agentUserId], references: [id])
+  sellerDirectoryId String?
+  sellerDirectory   ResidentDirectory?        @relation(fields: [sellerDirectoryId], references: [id])
+  sellerType        LedgerPartyType
+  materialCategory  MaterialCategory
+  grossWeightKg     Float
+  tareWeightKg      Float
+  netWeightKg       Float
+  ratePerKgTzs      Int
+  totalPayoutTzs    Int
+  capturedAt        DateTime
+  syncStatus        HubWeighInSyncStatus      @default(SYNCED)
+  idempotencyKey    String                    @unique
+  ledgerEntryId     String?                   @unique
+  ledgerEntry       LedgerEntry?              @relation(fields: [ledgerEntryId], references: [id])
+  createdAt         DateTime                  @default(now())
+
+  @@index([hubId, capturedAt])
+  @@index([sellerDirectoryId, capturedAt])
+}
+
+/// A wallet is shared across the resident and field-worker apps: the hub pays a
+/// resident, a collector or an independent picker into the same ledger shape.
+model SharedWallet {
+  id         String         @id @default(cuid())
+  partyType  LedgerPartyType
+  /// Directory id for external parties, user id for field workers.
+  partyRef   String
+  balanceTzs Int            @default(0)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  entries     LedgerEntry[]
+  directories ResidentDirectory[]
+
+  @@unique([partyType, partyRef])
+}
+
+model LedgerEntry {
+  id             String            @id @default(cuid())
+  walletId       String
+  wallet         SharedWallet      @relation(fields: [walletId], references: [id])
+  /// Positive credits the wallet, negative debits it.
+  amountTzs      Int
+  reason         LedgerEntryReason
+  referenceId    String?
+  idempotencyKey String            @unique
+  actorUserId    String?
+  actor          FieldWorkerUser?  @relation("LedgerActor", fields: [actorUserId], references: [id])
+  createdAt      DateTime          @default(now())
+
+  weighIn HubWeighIn?
+
+  @@index([walletId, createdAt])
+}
+
+/// A seller the hub can identify by phone hash or QR token. Populated from the
+/// resident directory sync; the field-worker server never stores the raw number.
+model ResidentDirectory {
+  id          String         @id @default(cuid())
+  phoneHash   String         @unique
+  displayName String
+  qrToken     String         @unique
+  partyType   LedgerPartyType @default(RESIDENT)
+  walletId    String?
+  wallet      SharedWallet?  @relation(fields: [walletId], references: [id])
+  syncedAt    DateTime       @default(now())
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  weighIns HubWeighIn[]
+}
+
+/// An illegal dump reported by a resident. The field-worker server mirrors the
+/// report id so a bounty can be traced back to the original report.
+model DumpReport {
+  id                String   @id @default(cuid())
+  reportId          String   @unique
+  latitude          Float
+  longitude         Float
+  wardName          String?
+  estimatedVolumeM3 Float
+  reportedAt        DateTime
+  createdAt         DateTime @default(now())
+
+  bounty BountyJob?
+
+  @@index([latitude, longitude])
+}
+
+model BountyJob {
+  id                 String           @id @default(cuid())
+  jobId              String           @unique
+  reportId           String           @unique
+  report             DumpReport       @relation(fields: [reportId], references: [id])
+  latitude           Float
+  longitude          Float
+  estimatedVolumeM3  Float
+  payoutAmountTzs    Int
+  status             BountyJobStatus  @default(AVAILABLE)
+  claimedByUserId    String?
+  claimedBy          FieldWorkerUser? @relation("BountyClaimedBy", fields: [claimedByUserId], references: [id])
+  claimedAt          DateTime?
+  claimExpiresAt     DateTime?
+  completionProofUrl String?
+  clearedTimestamp   DateTime?
+  approvedAt         DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  claims BountyClaim[]
+
+  @@index([status, claimExpiresAt])
+  @@index([latitude, longitude])
+}
+
+model BountyClaim {
+  id              String           @id @default(cuid())
+  jobId           String
+  job             BountyJob        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  responderUserId String
+  responder       FieldWorkerUser  @relation("BountyClaims", fields: [responderUserId], references: [id])
+  claimedAt       DateTime         @default(now())
+  expiresAt       DateTime
+  releasedAt      DateTime?
+  releaseReason   String?
+
+  @@index([jobId, claimedAt])
+  @@index([responderUserId])
+}
+
+/// An idempotency record for an offline sync task. The unique key is what makes
+/// a retried batch safe: a second delivery returns the stored response instead
+/// of applying the write again.
+model SyncReceipt {
+  id             String     @id @default(cuid())
+  idempotencyKey String     @unique
+  taskId         String
+  module         SyncModule
+  responseJson   Json
+  createdAt      DateTime   @default(now())
+
+  @@index([taskId])
+}
+
+model OtpChallenge {
+  id         String    @id @default(cuid())
+  phone      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([phone, createdAt])
+}
